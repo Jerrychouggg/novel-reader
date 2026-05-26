@@ -1,29 +1,56 @@
-"""阅读区域 — QScrollArea + QLabel 渲染文本"""
+"""阅读区域 — QScrollArea + QLabel 渲染文本，自适应窗口宽度"""
 from PySide6.QtWidgets import (
     QScrollArea, QLabel, QWidget, QVBoxLayout, QFrame,
 )
-from PySide6.QtCore import Qt, Signal, QEvent
-from PySide6.QtGui import QFont, QColor, QPalette, QMouseEvent
+from PySide6.QtCore import Qt, Signal, QEvent, QTimer
+from PySide6.QtGui import QFont, QColor, QPalette, QMouseEvent, QResizeEvent
+
+
+class _ReaderContainer(QWidget):
+    """内部容器：resize 时防抖更新边距，避免拖拽时频繁重排文字"""
+
+    def __init__(self, reader: "ReaderWidget", parent=None):
+        super().__init__(parent)
+        self._reader = reader
+        self.setObjectName("readerContainer")
+        # 防抖：resize 停止 120ms 后才更新边距
+        self._margin_timer = QTimer(self)
+        self._margin_timer.setSingleShot(True)
+        self._margin_timer.setInterval(120)
+        self._margin_timer.timeout.connect(self._apply_pending_margin)
+
+    def resizeEvent(self, event: QResizeEvent):
+        super().resizeEvent(event)
+        # 记录待处理的宽度，重启防抖计时器
+        self._pending_width = event.size().width()
+        self._margin_timer.start()
+
+    def _apply_pending_margin(self):
+        """resize 停止后才真正更新边距"""
+        w = getattr(self, '_pending_width', self.width())
+        self._reader._sync_margins_to_width(w)
 
 
 class ReaderWidget(QScrollArea):
     """核心阅读区域"""
 
-    # 信号
-    clicked = Signal()               # 点击切换控制栏
-    scrollChanged = Signal(float)    # 滚动比例 0.0~1.0
-    bottomReached = Signal()         # 到达底部
+    clicked = Signal()
+    scrollChanged = Signal(float)
+    bottomReached = Signal()
+
+    _MARGIN_MIN = 16
+    _MARGIN_MAX = 80
+    _MARGIN_RATIO = 0.06
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._chapters: list[str] = []
+        self._custom_text_color = ""
+        self._mini_mode = False
         self._setup_ui()
-        self._current_chapter_index = -1
-        self._chapters = []
-
-        # 安装事件过滤器,检测鼠标进入/离开
         self.viewport().installEventFilter(self)
 
-    # ── UI 初始化 ────────────────────────────────────────────
+    # ── UI ──────────────────────────────────────────────────
 
     def _setup_ui(self):
         self.setFrameShape(QFrame.Shape.NoFrame)
@@ -31,13 +58,10 @@ class ReaderWidget(QScrollArea):
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setWidgetResizable(True)
 
-        # 内部容器
-        container = QWidget()
-        container.setObjectName("readerContainer")
-        layout = QVBoxLayout(container)
+        self._container = _ReaderContainer(self)
+        layout = QVBoxLayout(self._container)
         layout.setContentsMargins(40, 20, 40, 20)
 
-        # 文本标签
         self.text_label = QLabel("拖入 txt/epub 文件开始阅读\n\n— 或者点击控制栏 📂 打开 —")
         self.text_label.setObjectName("readerLabel")
         self.text_label.setWordWrap(True)
@@ -45,94 +69,109 @@ class ReaderWidget(QScrollArea):
         self.text_label.setTextFormat(Qt.TextFormat.PlainText)
 
         layout.addWidget(self.text_label)
-        self.setWidget(container)
+        self.setWidget(self._container)
 
-    # ── 滚动控制 ──────────────────────────────────────────────
+    # ── 自适应边距 ──────────────────────────────────────────
+
+    def _calc_margin(self, width: int) -> int:
+        return max(self._MARGIN_MIN, min(self._MARGIN_MAX, int(width * self._MARGIN_RATIO)))
+
+    def _sync_margins_to_width(self, width: int):
+        """根据容器宽度更新左右边距（仅在 resize 停止后调用）"""
+        if self._mini_mode:
+            return
+        m = self._calc_margin(width)
+        lay = self._container.layout()
+        if lay:
+            lay.setContentsMargins(m, 20, m, 20)
+
+    def resizeEvent(self, event: QResizeEvent):
+        super().resizeEvent(event)
+
+    # ── 迷你模式 ────────────────────────────────────────────
+
+    def set_mini_mode(self, active: bool):
+        self._mini_mode = active
+        lay = self._container.layout()
+        if not lay:
+            return
+        if active:
+            lay.setContentsMargins(12, 4, 12, 4)
+            self.text_label.setWordWrap(False)
+            self.text_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+            font = self.text_label.font()
+            font.setPointSize(10)
+            self.text_label.setFont(font)
+        else:
+            m = self._calc_margin(self._container.width())
+            lay.setContentsMargins(m, 20, m, 20)
+            self.text_label.setWordWrap(True)
+            self.text_label.setAlignment(Qt.AlignmentFlag.AlignTop)
+        if self._chapters:
+            self._refresh_content()
+
+    def _refresh_content(self):
+        if self._chapters:
+            self.set_content(self._chapters)
+
+    def get_current_line(self) -> str:
+        if not self._chapters:
+            return ""
+        ratio = self.scroll_ratio()
+        total = len(self._chapters)
+        if total == 0:
+            return ""
+        idx = min(int(ratio * total), total - 1)
+        line = self._chapters[idx]
+        return line[:80] + ("…" if len(line) > 80 else "")
+
+    # ── 滚动 ────────────────────────────────────────────────
 
     def scroll_by(self, delta_pixels: float):
-        """滚动指定像素(用于自动滚动)"""
         bar = self.verticalScrollBar()
-        new_val = bar.value() + int(delta_pixels)
-        bar.setValue(new_val)
+        bar.setValue(bar.value() + int(delta_pixels))
 
     def scroll_to(self, position: int):
-        """滚动到指定像素位置"""
         self.verticalScrollBar().setValue(position)
 
     def scroll_position(self) -> int:
-        """当前滚动位置(像素)"""
         return self.verticalScrollBar().value()
 
-    def scroll_max(self) -> int:
-        """最大滚动位置"""
-        return self.verticalScrollBar().maximum()
-
     def scroll_ratio(self) -> float:
-        """当前滚动比例 0.0~1.0"""
         bar = self.verticalScrollBar()
-        if bar.maximum() == 0:
-            return 0.0
-        return bar.value() / bar.maximum()
+        return bar.value() / bar.maximum() if bar.maximum() > 0 else 0.0
 
-    # ── 内容设置 ──────────────────────────────────────────────
+    # ── 内容 ────────────────────────────────────────────────
 
     def set_content(self, paragraphs: list[str]):
-        """设置当前要显示的段落列表"""
-        text = "\n\n".join(paragraphs)
-        self.text_label.setText(text)
+        self._chapters = paragraphs
+        self.text_label.setText("\n\n".join(paragraphs))
 
     def clear(self):
-        """清空内容"""
         self.text_label.clear()
         self._chapters = []
-        self._current_chapter_index = -1
 
-    # ── 样式应用 ──────────────────────────────────────────────
+    # ── 样式 ────────────────────────────────────────────────
 
     def apply_theme(self, colors: dict, font: QFont):
-        """应用主题配色和字体"""
-        # 字体
         self.text_label.setFont(font)
-
-        # 阅读区容器背景
-        container = self.widget()
-        if container:
-            bg = colors["bg"]
-            style = f"""
-                QWidget#readerContainer {{
-                    background-color: {bg};
-                }}
-            """
-            container.setStyleSheet(style)
-
-        # 文字颜色
+        bg = colors["bg"]
+        self._container.setStyleSheet(f"QWidget#readerContainer {{ background-color: {bg}; }}")
+        text_color = self._custom_text_color or colors["text"]
         pal = self.text_label.palette()
-        pal.setColor(QPalette.ColorRole.WindowText, QColor(colors["text"]))
+        pal.setColor(QPalette.ColorRole.WindowText, QColor(text_color))
         self.text_label.setPalette(pal)
+        self.text_label.setStyleSheet(f"color: {text_color}; padding: 10px;")
 
-        # 同时也设样式确保生效
-        self.text_label.setStyleSheet(
-            f"color: {colors['text']}; padding: 10px;"
-        )
+    def set_custom_text_color(self, color: str):
+        self._custom_text_color = color
 
-    # ── 事件 ──────────────────────────────────────────────────
+    # ── 事件 ────────────────────────────────────────────────
 
     def mousePressEvent(self, event: QMouseEvent):
-        """点击发出信号"""
         self.clicked.emit()
         super().mousePressEvent(event)
 
-    def eventFilter(self, obj, event):
-        """检测滚动条变化"""
-        if obj == self.viewport():
-            if event.type() == QEvent.Type.Wheel:
-                # 滚轮后检查是否到底
-                ...
-
-        return super().eventFilter(obj, event)
-
     def wheelEvent(self, event):
-        """滚轮事件"""
         super().wheelEvent(event)
-        ratio = self.scroll_ratio()
-        self.scrollChanged.emit(ratio)
+        self.scrollChanged.emit(self.scroll_ratio())

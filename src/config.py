@@ -19,10 +19,18 @@ class ReaderConfig:
     window_x: int = -1  # -1 表示自动居中/底部
     window_y: int = -1
 
+    # 摸鱼模式
+    mini_mode: bool = False
+    mini_width: int = 420
+    mini_height: int = 80
+
     # 字体
     font_family: str = "Microsoft YaHei"
     font_size: int = 16
     line_spacing: float = 1.8
+
+    # 自定义文字颜色（空字符串表示跟随主题）
+    custom_text_color: str = ""
 
     # 主题: "light" / "dark" / "eye_green" / "eye_warm" / "transparent"
     theme: str = "dark"
@@ -56,15 +64,23 @@ THEMES = {
         "control_hover": "rgba(200, 200, 200, 0.9)",
         "progress_bg": "#DDDDDD",
         "progress_fg": "#4A90D9",
+        "mini_bg": "rgba(245,245,245,0.92)",
+        "mini_text": "#333333",
+        "mini_hover": "rgba(210,210,210,0.8)",
+        "mini_btn": "#555555",
     },
     "dark": {
-        "bg": "transparent",   # 透明,让模糊背景透出
+        "bg": "transparent",
         "text": "#E8E8E8",
         "control_bg": "rgba(30, 30, 30, 0.75)",
         "control_text": "#CCCCCC",
         "control_hover": "rgba(60, 60, 60, 0.85)",
         "progress_bg": "#444444",
         "progress_fg": "#6CB4EE",
+        "mini_bg": "rgba(20,20,25,0.9)",
+        "mini_text": "#D0D0D0",
+        "mini_hover": "rgba(60,60,70,0.7)",
+        "mini_btn": "#A0A0A0",
     },
     "eye_green": {
         "bg": "#C8D9C0",
@@ -74,6 +90,10 @@ THEMES = {
         "control_hover": "rgba(140, 170, 130, 0.9)",
         "progress_bg": "#A0B898",
         "progress_fg": "#3D6B3E",
+        "mini_bg": "rgba(180,210,175,0.92)",
+        "mini_text": "#1A2E1B",
+        "mini_hover": "rgba(150,180,145,0.8)",
+        "mini_btn": "#3D6B3E",
     },
     "eye_warm": {
         "bg": "#F5E6C8",
@@ -83,6 +103,10 @@ THEMES = {
         "control_hover": "rgba(200, 180, 140, 0.9)",
         "progress_bg": "#D4C4A8",
         "progress_fg": "#8B6B4A",
+        "mini_bg": "rgba(240,225,195,0.92)",
+        "mini_text": "#3D2E20",
+        "mini_hover": "rgba(210,190,155,0.8)",
+        "mini_btn": "#8B6B4A",
     },
     "transparent": {
         "bg": "transparent",
@@ -92,6 +116,10 @@ THEMES = {
         "control_hover": "rgba(60, 60, 60, 0.6)",
         "progress_bg": "rgba(255,255,255,0.2)",
         "progress_fg": "rgba(255,255,255,0.7)",
+        "mini_bg": "rgba(0,0,0,0.6)",
+        "mini_text": "#FFFFFF",
+        "mini_hover": "rgba(80,80,80,0.5)",
+        "mini_btn": "#CCCCCC",
     },
 }
 

@@ -2,9 +2,10 @@
 import os
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QMessageBox, QLabel,
+    QSizeGrip, QGraphicsDropShadowEffect,
 )
-from PySide6.QtCore import Qt, QTimer, Signal, QPoint
-from PySide6.QtGui import QFont, QColor, QCursor, QMouseEvent
+from PySide6.QtCore import Qt, QTimer, Signal, QPoint, QSize
+from PySide6.QtGui import QFont, QColor, QCursor, QMouseEvent, QIcon
 
 from src.blur_effect import apply_blur
 from src.config import (
@@ -14,7 +15,38 @@ from src.config import (
 from src.book_manager import load_book, Book, Chapter
 from src.auto_scroller import AutoScroller
 from src.reader_widget import ReaderWidget
-from src.control_bar import ControlBar
+from src.control_bar import ControlBar, MiniControlBar
+
+
+class ResizeGrip(QWidget):
+    """可视调整大小手柄（右边缘 + 右下角）"""
+
+    def __init__(self, edge: str, parent=None):
+        super().__init__(parent)
+        self._edge = edge  # "right" or "bottom_right"
+        self.setMouseTracking(True)
+        if edge == "right":
+            self.setFixedWidth(6)
+            self.setCursor(Qt.CursorShape.SizeHorCursor)
+        else:
+            self.setFixedSize(14, 14)
+            self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.window()._start_resize_grip(self._edge, event.globalPosition().toPoint())
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if hasattr(self.window(), '_resize_edge') and self.window()._resize_grip_active:
+            self.window()._do_resize_grip(event.globalPosition().toPoint())
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if hasattr(self.window(), '_resize_grip_active'):
+            self.window()._resize_grip_active = False
+            self.window()._resize_edge = 0
+        super().mouseReleaseEvent(event)
 
 
 class NovelReader(QMainWindow):
@@ -29,13 +61,22 @@ class NovelReader(QMainWindow):
         self._font_size = self.config.font_size
         self._theme = self.config.theme
         self._scrolling = False
+        self._mini_mode = self.config.mini_mode
 
         # 拖拽 / 调整大小 状态
-        self._RESIZE_MARGIN = 8          # 边缘调整大小的感应区域(px)
-        self._moving = False             # 是否正在拖动窗口
-        self._resize_edge = 0            # 0=无, 1=顶, 2=左, 3=右, 4=左上, 5=右上
-        self._drag_start_pos = QPoint()  # 拖动起始鼠标位置(全局坐标)
-        self._drag_start_geom = None     # 拖动起始窗口几何
+        self._RESIZE_MARGIN = 15          # 边缘调整大小的感应区域(px)
+        self._moving = False              # 是否正在拖动窗口
+        self._resize_edge = 0             # 0=无, 1=顶, 2=左, 3=右, 4=左上, 5=右上, 6=下
+        self._drag_start_pos = QPoint()   # 拖动起始鼠标位置(全局坐标)
+        self._drag_start_geom = None      # 拖动起始窗口几何
+        self._resize_grip_active = False  # resize grip 是否激活
+        self._resize_grip_type = ""       # grip 类型
+
+        # 防抖保存（resize/move 结束后 400ms 才写盘）
+        self._save_timer = QTimer(self)
+        self._save_timer.setSingleShot(True)
+        self._save_timer.setInterval(400)
+        self._save_timer.timeout.connect(lambda: save_config(self.config))
 
         self._setup_window()
         self._setup_ui()
@@ -79,15 +120,16 @@ class NovelReader(QMainWindow):
             return
 
         avail = screen.availableGeometry()  # 不含任务栏的工作区
-        full = screen.geometry()            # 全屏区域
 
-        w = avail.width()
-        h = self.config.window_height
+        if self._mini_mode:
+            w = self.config.mini_width
+            h = self.config.mini_height
+        else:
+            w = self.config.window_width if self.config.window_width > 0 else avail.width()
+            h = self.config.window_height
+
         x = avail.x()
         y = avail.y() + avail.height() - h
-
-        # 如果任务栏在底部,avail.height < full.height
-        # 已由 availableGeometry 自动处理
 
         # 使用保存的位置(如果有)
         if self.config.window_x >= 0:
@@ -97,7 +139,10 @@ class NovelReader(QMainWindow):
 
         self.setGeometry(x, y, w, h)
         # 保证最小尺寸
-        self.setMinimumSize(400, 100)
+        if self._mini_mode:
+            self.setMinimumSize(200, 36)
+        else:
+            self.setMinimumSize(400, 100)
 
     def _on_window_resize(self, delta: int):
         """按钮调整窗口高度"""
@@ -112,15 +157,41 @@ class NovelReader(QMainWindow):
         self.setGeometry(self.x(), self.y(), new_w, self.height())
 
     def showEvent(self, event):
-        """窗口显示时应用模糊"""
+        """窗口显示时应用模糊,并处理初始迷你模式"""
         super().showEvent(event)
         QTimer.singleShot(50, self._apply_blur)
+        # 启动时如果配置为迷你模式，切换到迷你模式
+        if self._mini_mode and not self.reader._mini_mode:
+            QTimer.singleShot(150, self._apply_initial_mini_mode)
 
     def _apply_blur(self):
         """应用 Windows Acrylic/Mica 模糊"""
         hwnd = int(self.winId())
         result = apply_blur(hwnd)
         print(f"[模糊效果] 策略: {result}")
+
+    def _apply_initial_mini_mode(self):
+        """启动时应用迷你模式状态（不触发保存）"""
+        self._mini_mode = True
+        self.reader.set_mini_mode(True)
+        self.control_bar.setVisible(False)
+        self.mini_bar.setVisible(True)
+        self.grip_right.setVisible(False)
+        self.control_bar.set_mini_state(True)
+        avail = self.screen().availableGeometry()
+        mw = self.config.mini_width
+        mh = self.config.mini_height
+        mx = avail.x() + avail.width() - mw - 10
+        my = avail.y() + avail.height() - mh - 2
+        self.setGeometry(mx, my, mw, mh)
+        self.setMinimumSize(260, 60)
+        self._apply_theme()
+        if self.book:
+            line = self.reader.get_current_line()
+            self.mini_bar.set_current_line(line)
+            self.setWindowTitle(f"🐟 {self.book.title}")
+        else:
+            self.setWindowTitle("🐟 摸鱼中…")
 
     # ── UI ────────────────────────────────────────────────────
 
@@ -132,6 +203,11 @@ class NovelReader(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
+        # 迷你模式顶栏（默认隐藏）
+        self.mini_bar = MiniControlBar()
+        self.mini_bar.setVisible(False)
+        layout.addWidget(self.mini_bar)
+
         # 阅读区域
         self.reader = ReaderWidget()
         layout.addWidget(self.reader, 1)
@@ -142,10 +218,21 @@ class NovelReader(QMainWindow):
 
         self.setCentralWidget(central)
 
+        # 调整大小手柄
+        self.grip_right = ResizeGrip("right", self)
+        self.grip_corner = ResizeGrip("bottom_right", self)
+        self._place_resize_grips()
+
         # 自动滚动器
         self.scroller = AutoScroller(self)
         self.scroller.set_scroll_callback(self.reader.scroll_by)
         self.scroller.speed = self.config.auto_scroll_speed
+
+    def _place_resize_grips(self):
+        """放置调整大小手柄"""
+        w, h = self.width(), self.height()
+        self.grip_right.setGeometry(w - 6, 0, 6, h - 14)
+        self.grip_corner.setGeometry(w - 14, h - 14, 14, 14)
 
     # ── 信号连接 ──────────────────────────────────────────────
 
@@ -162,6 +249,17 @@ class NovelReader(QMainWindow):
         self.control_bar.windowWidthResizeRequested.connect(self._on_window_width_resize)
         self.control_bar.pageUp.connect(self._on_page_up)
         self.control_bar.pageDown.connect(self._on_page_down)
+        self.control_bar.miniModeToggled.connect(self._toggle_mini_mode)
+        self.control_bar.textColorRequested.connect(self._on_text_color_change)
+
+        # 迷你栏信号
+        self.mini_bar.toggleScroll.connect(self._on_toggle_scroll)
+        self.mini_bar.speedChanged.connect(self._on_speed_change)
+        self.mini_bar.pageUp.connect(self._on_page_up)
+        self.mini_bar.pageDown.connect(self._on_page_down)
+        self.mini_bar.fontChanged.connect(self._on_font_change)
+        self.mini_bar.exitMini.connect(self._toggle_mini_mode)
+        self.mini_bar.openFileRequested.connect(self._on_open_file)
 
         # 阅读区信号
         self.reader.clicked.connect(self.control_bar.show_bar)
@@ -227,11 +325,15 @@ class NovelReader(QMainWindow):
         self.scroller.toggle()
         self._scrolling = self.scroller.enabled
         self.control_bar.set_scroll_state(self._scrolling)
+        if self._mini_mode:
+            self.mini_bar.set_scroll_state(self._scrolling)
 
     def _on_speed_change(self, value: int):
         self.scroller.speed = value
         self.config.auto_scroll_speed = value
         save_config(self.config)
+        if self._mini_mode:
+            self.mini_bar.set_speed(value)
 
     def _sync_scroll_state(self):
         """定时同步滚动进度到控制栏"""
@@ -241,6 +343,12 @@ class NovelReader(QMainWindow):
         if self.book.chapters:
             ch = self.book.chapters[self._current_chapter_idx]
             self.control_bar.set_progress(ratio, ch.title)
+
+            # 迷你模式：更新顶栏文本
+            if self._mini_mode:
+                line = self.reader.get_current_line()
+                if line:
+                    self.mini_bar.set_current_line(line)
 
         # 到达底部时自动切下一章
         if ratio >= 0.99 and self._scrolling:
@@ -268,13 +376,24 @@ class NovelReader(QMainWindow):
 
     def _apply_theme(self):
         colors = get_theme_colors(self._theme)
-        self.control_bar.apply_theme(colors)
-        self.reader.apply_theme(colors, QFont(self.config.font_family, self._font_size))
+        # 自定义文字颜色
+        if self.config.custom_text_color:
+            self.reader.set_custom_text_color(self.config.custom_text_color)
+        else:
+            self.reader.set_custom_text_color("")
 
-        # 中央容器背景
+        self.control_bar.apply_theme(colors)
+        self.mini_bar.apply_theme(colors)
+        font = QFont(self.config.font_family, self._font_size)
+        self.reader.apply_theme(colors, font)
+
+        # 中央容器背景 + 圆角
+        bg = colors["bg"]
+        radius = "12px" if self._mini_mode else "16px"
         style = f"""
             QWidget#centralWidget {{
-                background-color: {colors['bg']};
+                background-color: {bg};
+                border-radius: {radius};
             }}
         """
         self.centralWidget().setStyleSheet(style)
@@ -282,7 +401,7 @@ class NovelReader(QMainWindow):
     # ── 字体 ──────────────────────────────────────────────────
 
     def _on_font_change(self, family: str, delta: int, spacing: float):
-        """字号调整(+1/-1)"""
+        """字号调整"""
         self._font_size = max(10, min(40, self._font_size + delta))
         self.config.font_size = self._font_size
         save_config(self.config)
@@ -290,9 +409,12 @@ class NovelReader(QMainWindow):
 
     def _apply_font(self):
         """应用字体设置"""
-        # 行距通过样式设置
         font = QFont(self.config.font_family, self._font_size)
-        self.reader.text_label.setFont(font)
+        # 迷你模式下不覆盖阅读区字体（迷你模式用小字号）
+        if not self._mini_mode:
+            self.reader.text_label.setFont(font)
+        # 重新应用主题以刷新文字颜色
+        self._apply_theme()
 
     # ── 拖拽支持 ──────────────────────────────────────────────
 
@@ -335,21 +457,19 @@ class NovelReader(QMainWindow):
         super().resizeEvent(event)
         self.config.window_width = self.width()
         self.config.window_height = self.height()
-        save_config(self.config)
-        # 重设控制栏位置
-        self.control_bar.setGeometry(
-            0, self.height() - self.control_bar.height(),
-            self.width(), self.control_bar.height()
-        )
+        self._save_timer.start()  # 防抖
+        # grips 需要手动定位（不在布局中）
+        self._place_resize_grips()
 
     def moveEvent(self, event):
         super().moveEvent(event)
         self.config.window_x = self.x()
         self.config.window_y = self.y()
-        save_config(self.config)
+        self._save_timer.start()  # 防抖
 
     def closeEvent(self, event):
         """关闭前保存书签和配置"""
+        self._save_timer.stop()
         self._save_bookmark()
         save_config(self.config)
         super().closeEvent(event)
@@ -357,10 +477,11 @@ class NovelReader(QMainWindow):
     # ── 窗口拖拽 & 调整大小 ──────────────────────────────────
 
     def _detect_edge(self, pos: QPoint) -> int:
-        """检测鼠标靠近哪个边缘/角落: 0=无, 1=顶, 2=左, 3=右, 4=左上, 5=右上"""
+        """检测鼠标靠近哪个边缘/角落: 0=无, 1=顶, 2=左, 3=右, 4=左上, 5=右上, 6=下"""
         m = self._RESIZE_MARGIN
         w, h = self.width(), self.height()
         top = pos.y() <= m
+        bottom = pos.y() >= h - m
         left = pos.x() <= m
         right = pos.x() >= w - m
 
@@ -374,6 +495,8 @@ class NovelReader(QMainWindow):
             return 2   # 左边
         if right:
             return 3   # 右边
+        if bottom:
+            return 6   # 底边
         return 0
 
     def _edge_cursor(self, edge: int) -> Qt.CursorShape:
@@ -382,6 +505,8 @@ class NovelReader(QMainWindow):
             return Qt.CursorShape.SizeVerCursor
         if edge in (2, 3):  # 左/右边
             return Qt.CursorShape.SizeHorCursor
+        if edge == 6:   # 底边
+            return Qt.CursorShape.SizeVerCursor
         if edge == 4:   # 左上角
             return Qt.CursorShape.SizeFDiagCursor
         if edge == 5:   # 右上角
@@ -420,28 +545,32 @@ class NovelReader(QMainWindow):
             edge = self._resize_edge
             x, y, w, h = g0.x(), g0.y(), g0.width(), g0.height()
             screen_w = self.screen().availableGeometry().width() if self.screen() else 1920
+            screen_h = self.screen().availableGeometry().height() if self.screen() else 1080
+            min_w, min_h = 400, 100
 
             if edge == 1:  # 顶边 — 调整高度
-                new_h = max(100, min(600, h + delta.y()))
+                new_h = max(min_h, min(600, h + delta.y()))
                 y = g0.y() - (new_h - h)
                 h = new_h
             elif edge == 2:  # 左边 — 调整宽度
-                new_w = max(400, min(screen_w, w + delta.x()))
+                new_w = max(min_w, min(screen_w, w + delta.x()))
                 x = g0.x() - (new_w - w)
                 w = new_w
             elif edge == 3:  # 右边 — 调整宽度
-                w = max(400, min(screen_w, w - delta.x()))
+                w = max(min_w, min(screen_w, w - delta.x()))
             elif edge == 4:  # 左上角 — 同时调宽高
-                new_w = max(400, min(screen_w, w + delta.x()))
-                new_h = max(100, min(600, h + delta.y()))
+                new_w = max(min_w, min(screen_w, w + delta.x()))
+                new_h = max(min_h, min(600, h + delta.y()))
                 x = g0.x() - (new_w - w)
                 y = g0.y() - (new_h - h)
                 w, h = new_w, new_h
             elif edge == 5:  # 右上角 — 同时调宽高
-                new_w = max(400, min(screen_w, w - delta.x()))
-                new_h = max(100, min(600, h + delta.y()))
+                new_w = max(min_w, min(screen_w, w - delta.x()))
+                new_h = max(min_h, min(600, h + delta.y()))
                 y = g0.y() - (new_h - h)
                 w, h = new_w, new_h
+            elif edge == 6:  # 底边 — 调整高度
+                h = max(min_h, min(600, h - delta.y()))
 
             self.setGeometry(x, y, w, h)
 
@@ -459,6 +588,105 @@ class NovelReader(QMainWindow):
         self._resize_edge = 0
         super().mouseReleaseEvent(event)
 
+    # ── Resize Grip 方法 ─────────────────────────────────────
+
+    def _start_resize_grip(self, grip_type: str, global_pos: QPoint):
+        """开始通过 grip 调整大小"""
+        self._resize_grip_active = True
+        self._resize_grip_type = grip_type
+        self._drag_start_pos = global_pos
+        self._drag_start_geom = self.geometry()
+        if grip_type == "right":
+            self._resize_edge = 3
+        elif grip_type == "bottom_right":
+            self._resize_edge = 0  # 使用自定义逻辑
+        else:
+            self._resize_edge = 3
+        self._moving = False
+
+    def _do_resize_grip(self, global_pos: QPoint):
+        """执行 grip 调整大小"""
+        g0 = self._drag_start_geom
+        if not g0:
+            return
+        delta = self._drag_start_pos - global_pos
+        x, y, w, h = g0.x(), g0.y(), g0.width(), g0.height()
+        screen_w = self.screen().availableGeometry().width() if self.screen() else 1920
+        screen_h = self.screen().availableGeometry().height() if self.screen() else 1080
+
+        if self._resize_grip_type == "right":
+            w = max(400, min(screen_w, w - delta.x()))
+        elif self._resize_grip_type == "bottom_right":
+            w = max(400, min(screen_w, w - delta.x()))
+            h = max(100, min(600, h - delta.y()))
+
+        self.setGeometry(x, y, w, h)
+
+    # ── 摸鱼模式 ──────────────────────────────────────────────
+
+    def _toggle_mini_mode(self):
+        """切换摸鱼模式"""
+        self._mini_mode = not self._mini_mode
+        self.config.mini_mode = self._mini_mode
+        save_config(self.config)
+
+        if self._mini_mode:
+            # 进入迷你模式 — 保存当前尺寸
+            self.config.window_width = self.width()
+            self.config.window_height = self.height()
+            self.config.window_x = self.x()
+            self.config.window_y = self.y()
+
+            self.reader.set_mini_mode(True)
+            self.control_bar.setVisible(False)
+            self.mini_bar.setVisible(True)
+            self.grip_right.setVisible(False)
+
+            avail = self.screen().availableGeometry()
+            mw = self.config.mini_width
+            mh = self.config.mini_height
+            mx = avail.x() + avail.width() - mw - 10
+            my = avail.y() + avail.height() - mh - 2
+            self.setGeometry(mx, my, mw, mh)
+            self.setMinimumSize(260, 60)
+
+            self.mini_bar.set_scroll_state(self._scrolling)
+            self.mini_bar.set_speed(self.scroller.speed)
+            if self.book:
+                self.mini_bar.set_current_line(self.reader.get_current_line())
+                self.setWindowTitle(f"🐟 {self.book.title}")
+            else:
+                self.setWindowTitle("🐟 摸鱼中…")
+        else:
+            # 退出迷你模式
+            self.reader.set_mini_mode(False)
+            self.control_bar.setVisible(True)
+            self.mini_bar.setVisible(False)
+            self.grip_right.setVisible(True)
+            self._position_window()
+            self.setMinimumSize(400, 100)
+            if self.book:
+                self.setWindowTitle(f"小阅 — {self.book.title}")
+            else:
+                self.setWindowTitle("小阅 — 桌面小说阅读器")
+
+        self.control_bar.set_mini_state(self._mini_mode)
+        self._apply_theme()
+
+    # ── 文字颜色 ──────────────────────────────────────────────
+
+    def _on_text_color_change(self, color_name: str):
+        """更改文字颜色"""
+        self.config.custom_text_color = color_name
+        save_config(self.config)
+        self.reader.set_custom_text_color(color_name)
+        self._apply_theme()
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent):
+        """双击切换迷你模式"""
+        self._toggle_mini_mode()
+        super().mouseDoubleClickEvent(event)
+
     # ── 键盘快捷键 ────────────────────────────────────────────
 
     def keyPressEvent(self, event):
@@ -467,7 +695,14 @@ class NovelReader(QMainWindow):
             # 空格切换自动滚动
             self._on_toggle_scroll()
         elif key == Qt.Key.Key_Escape:
-            self.close()
+            # 迷你模式下 Esc 退出迷你模式
+            if self._mini_mode:
+                self._toggle_mini_mode()
+            else:
+                self.close()
+        elif key == Qt.Key.Key_M and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            # Ctrl+M 切换摸鱼模式
+            self._toggle_mini_mode()
         elif key == Qt.Key.Key_PageUp or key == Qt.Key.Key_Left:
             # 上一页
             self._on_page_up()
